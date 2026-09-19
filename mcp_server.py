@@ -3,6 +3,7 @@
 claude-mail-bridge MCP Server
 给你的 AI 一个邮箱——MCP 版。
 AI 可以主动收信、发信、搜索邮件。
+发信通过 IMAP 存草稿（绕过 Railway 等云平台的 SMTP 端口封锁）。
 
 Author: Claude Opus 4.6 & its human
 License: MIT
@@ -11,14 +12,14 @@ License: MIT
 import os
 import json
 import imaplib
-import smtplib
-import socket
 import email
 import logging
+import urllib.request
+import urllib.parse
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
-from email.utils import formataddr
+from email.utils import formataddr, formatdate
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -32,7 +33,6 @@ log = logging.getLogger("mail_bridge")
 # ── Load Config ────────────────────────────────────────────────
 
 def load_config() -> dict:
-    # 优先环境变量，其次 config.json
     if os.environ.get("MAIL_ADDRESS"):
         return {
             "email": {
@@ -40,8 +40,6 @@ def load_config() -> dict:
                 "password": os.environ["MAIL_PASSWORD"],
                 "imap_host": os.environ.get("IMAP_HOST", "imap.qq.com"),
                 "imap_port": int(os.environ.get("IMAP_PORT", "993")),
-                "smtp_host": os.environ.get("SMTP_HOST", "smtp.qq.com"),
-                "smtp_port": int(os.environ.get("SMTP_PORT", "587")),
                 "display_name": os.environ.get("DISPLAY_NAME", "Claude"),
             }
         }
@@ -54,17 +52,15 @@ def load_config() -> dict:
 CFG = load_config()
 EMAIL = CFG["email"]
 
+# Bark 推送地址（可选）
+BARK_URL = os.environ.get("BARK_URL", "")
+
 # ── MCP Server ─────────────────────────────────────────────────
 
-# host="0.0.0.0" 让云平台（Zeabur/Railway/Render）能正确代理请求
-# 本地跑也不影响
 _port = int(os.environ.get("PORT", "8877"))
 mcp = FastMCP("mail_bridge", host="0.0.0.0", port=_port)
 
 # ── Helpers ────────────────────────────────────────────────────
-
-# SMTP 连接超时（秒）
-SMTP_TIMEOUT = int(os.environ.get("SMTP_TIMEOUT", "30"))
 
 def _decode(value: str) -> str:
     if not value:
@@ -100,10 +96,9 @@ def _get_body(msg: email.message.Message) -> str:
     return ""
 
 
-
 def _send_imap_id(conn):
     """163/126 等网易邮箱要求客户端先发 IMAP ID 命令自报身份，
-    否则 SELECT 会返回 "Unsafe Login"。对其他服务器无副作用，best-effort。"""
+    否则 SELECT 会返回 "Unsafe Login"。"""
     try:
         if "ID" in getattr(conn, "capabilities", ()):
             imaplib.Commands.setdefault("ID", ("AUTH", "SELECTED"))
@@ -112,6 +107,7 @@ def _send_imap_id(conn):
             )
     except Exception:
         pass
+
 
 def _imap():
     conn = imaplib.IMAP4_SSL(EMAIL["imap_host"], EMAIL.get("imap_port", 993))
@@ -130,43 +126,39 @@ def _summary(msg, uid: str) -> dict:
     }
 
 
-def _smtp_send(msg, recipients):
-    """尝试发送邮件。依次尝试 465(SSL) 和 25(plain+STARTTLS)。"""
-    smtp_host = EMAIL["smtp_host"]
-    errors = []
+def _find_drafts_folder(conn) -> str:
+    """找到草稿箱文件夹名。163 的草稿箱是 UTF-7 编码的。"""
+    st, folders = conn.list()
+    if st != "OK":
+        return "Drafts"
+    for f in folders:
+        if isinstance(f, bytes):
+            decoded = f.decode("utf-8", errors="replace")
+            # 163 草稿箱的 UTF-7 编码
+            if "&g0l6P3ux-" in decoded:
+                return "&g0l6P3ux-"
+            lower = decoded.lower()
+            if "draft" in lower or "草稿" in lower:
+                parts = decoded.split(' "/" ')
+                if len(parts) == 2:
+                    return parts[1].strip('"')
+    return "Drafts"
 
-    # 尝试1: 465 SSL
+
+def _bark_notify(title: str, body: str):
+    """发送 Bark 推送通知（best-effort）。"""
+    if not BARK_URL:
+        return
     try:
-        log.info(f"SMTP: trying {smtp_host}:465 SSL (timeout={SMTP_TIMEOUT}s)")
-        with smtplib.SMTP_SSL(smtp_host, 465, timeout=SMTP_TIMEOUT) as server:
-            server.ehlo()
-            server.login(EMAIL["address"], EMAIL["password"])
-            server.sendmail(EMAIL["address"], recipients, msg.as_string())
-            log.info("SMTP: sent via 465 SSL")
-            return
+        url = BARK_URL.rstrip("/")
+        encoded_title = urllib.parse.quote(title, safe="")
+        encoded_body = urllib.parse.quote(body, safe="")
+        full_url = f"{url}/{encoded_title}/{encoded_body}"
+        req = urllib.request.Request(full_url, method="GET")
+        urllib.request.urlopen(req, timeout=10)
+        log.info(f"Bark notify sent: {title}")
     except Exception as e:
-        log.warning(f"SMTP 465 failed: {e}")
-        errors.append(f"465/SSL: {e}")
-
-    # 尝试2: 25 plain with STARTTLS
-    try:
-        log.info(f"SMTP: trying {smtp_host}:25 STARTTLS (timeout={SMTP_TIMEOUT}s)")
-        with smtplib.SMTP(smtp_host, 25, timeout=SMTP_TIMEOUT) as server:
-            server.ehlo()
-            try:
-                server.starttls()
-                server.ehlo()
-            except Exception:
-                pass  # 25端口可能不支持STARTTLS，继续尝试
-            server.login(EMAIL["address"], EMAIL["password"])
-            server.sendmail(EMAIL["address"], recipients, msg.as_string())
-            log.info("SMTP: sent via 25")
-            return
-    except Exception as e:
-        log.warning(f"SMTP 25 failed: {e}")
-        errors.append(f"25/STARTTLS: {e}")
-
-    raise RuntimeError(f"所有SMTP端口均失败: {'; '.join(errors)}")
+        log.warning(f"Bark notify failed: {e}")
 
 
 # ── Tools ──────────────────────────────────────────────────────
@@ -273,28 +265,56 @@ class SendInput(BaseModel):
 
 @mcp.tool(name="mail_send")
 async def mail_send(params: SendInput) -> str:
-    """发送一封邮件。"""
+    """写好邮件并存到草稿箱，等待人工审核后发送。（Railway 等平台封锁了 SMTP 端口，
+    所以通过 IMAP 存草稿绕过限制。）"""
     try:
         msg = MIMEMultipart()
         msg["From"] = formataddr((EMAIL.get("display_name", "Claude"), EMAIL["address"]))
         msg["To"] = params.to
         msg["Subject"] = params.subject
+        msg["Date"] = formatdate(localtime=True)
         if params.cc:
             msg["Cc"] = params.cc
         msg.attach(MIMEText(params.body, "plain", "utf-8"))
 
-        recipients = [params.to]
-        if params.cc:
-            recipients.extend([a.strip() for a in params.cc.split(",")])
+        conn = _imap()
+        drafts_folder = _find_drafts_folder(conn)
+        log.info(f"Saving draft to folder: {drafts_folder}")
 
-        _smtp_send(msg, recipients)
+        # 选中草稿箱并写入
+        st = conn.select(drafts_folder)
+        if st[0] != "OK":
+            # 如果选中失败，尝试创建
+            conn.create(drafts_folder)
+            conn.select(drafts_folder)
 
-        # 存到已发送（best-effort，跳过以减少超时风险）
-        # 163的已发送文件夹编码名不好猜，先不存了
+        result = conn.append(
+            drafts_folder,
+            "\\Draft",
+            imaplib.Time2Internaldate(datetime.now(timezone.utc)),
+            msg.as_bytes()
+        )
+        conn.logout()
 
-        return json.dumps({"status": "sent", "to": params.to, "subject": params.subject}, ensure_ascii=False)
+        if result[0] == "OK":
+            log.info(f"Draft saved: to={params.to} subject={params.subject}")
+            # 发 Bark 通知
+            _bark_notify(
+                "📬 新草稿待审核",
+                f"收件人: {params.to}\n主题: {params.subject}\n请打开163邮箱草稿箱审核并发送"
+            )
+            return json.dumps({
+                "status": "draft_saved",
+                "to": params.to,
+                "subject": params.subject,
+                "message": "邮件已存入草稿箱，请在163邮箱app中打开草稿箱审核并点击发送"
+            }, ensure_ascii=False)
+        else:
+            return f"存草稿失败: {result}"
+
     except Exception as e:
-        return f"发送失败: {e}"
+        log.error(f"Draft save failed: {e}")
+        return f"存草稿失败: {e}"
 
 
 @mcp.tool(name="mail_folders")
@@ -320,10 +340,8 @@ async def mail_folders() -> str:
 if __name__ == "__main__":
     import sys
 
-    log.info(f"Mail bridge starting: {EMAIL['address']} | SMTP {EMAIL['smtp_host']}:{EMAIL.get('smtp_port',465)} | timeout={SMTP_TIMEOUT}s")
+    log.info(f"Mail bridge starting: {EMAIL['address']} | IMAP {EMAIL['imap_host']}:{EMAIL.get('imap_port',993)} | draft mode (SMTP bypassed)")
 
-    # 默认 SSE 模式（云平台兼容性最好，端点在 /sse）
-    # 可选 streamable-http 模式（端点在 /mcp）
     transport = os.environ.get("MCP_TRANSPORT", "sse")
 
     if "--streamable-http" in sys.argv:
