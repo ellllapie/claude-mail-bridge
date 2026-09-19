@@ -12,7 +12,9 @@ import os
 import json
 import imaplib
 import smtplib
+import socket
 import email
+import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
@@ -23,6 +25,9 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field, ConfigDict
 from pathlib import Path
+
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(message)s")
+log = logging.getLogger("mail_bridge")
 
 # ── Load Config ────────────────────────────────────────────────
 
@@ -57,6 +62,9 @@ _port = int(os.environ.get("PORT", "8877"))
 mcp = FastMCP("mail_bridge", host="0.0.0.0", port=_port)
 
 # ── Helpers ────────────────────────────────────────────────────
+
+# SMTP 连接超时（秒）
+SMTP_TIMEOUT = int(os.environ.get("SMTP_TIMEOUT", "30"))
 
 def _decode(value: str) -> str:
     if not value:
@@ -120,6 +128,45 @@ def _summary(msg, uid: str) -> dict:
         "subject": _decode(msg.get("Subject", "")),
         "date": msg.get("Date", ""),
     }
+
+
+def _smtp_send(msg, recipients):
+    """尝试发送邮件。依次尝试 465(SSL) 和 25(plain+STARTTLS)。"""
+    smtp_host = EMAIL["smtp_host"]
+    errors = []
+
+    # 尝试1: 465 SSL
+    try:
+        log.info(f"SMTP: trying {smtp_host}:465 SSL (timeout={SMTP_TIMEOUT}s)")
+        with smtplib.SMTP_SSL(smtp_host, 465, timeout=SMTP_TIMEOUT) as server:
+            server.ehlo()
+            server.login(EMAIL["address"], EMAIL["password"])
+            server.sendmail(EMAIL["address"], recipients, msg.as_string())
+            log.info("SMTP: sent via 465 SSL")
+            return
+    except Exception as e:
+        log.warning(f"SMTP 465 failed: {e}")
+        errors.append(f"465/SSL: {e}")
+
+    # 尝试2: 25 plain with STARTTLS
+    try:
+        log.info(f"SMTP: trying {smtp_host}:25 STARTTLS (timeout={SMTP_TIMEOUT}s)")
+        with smtplib.SMTP(smtp_host, 25, timeout=SMTP_TIMEOUT) as server:
+            server.ehlo()
+            try:
+                server.starttls()
+                server.ehlo()
+            except Exception:
+                pass  # 25端口可能不支持STARTTLS，继续尝试
+            server.login(EMAIL["address"], EMAIL["password"])
+            server.sendmail(EMAIL["address"], recipients, msg.as_string())
+            log.info("SMTP: sent via 25")
+            return
+    except Exception as e:
+        log.warning(f"SMTP 25 failed: {e}")
+        errors.append(f"25/STARTTLS: {e}")
+
+    raise RuntimeError(f"所有SMTP端口均失败: {'; '.join(errors)}")
 
 
 # ── Tools ──────────────────────────────────────────────────────
@@ -236,38 +283,14 @@ async def mail_send(params: SendInput) -> str:
             msg["Cc"] = params.cc
         msg.attach(MIMEText(params.body, "plain", "utf-8"))
 
-        smtp_port = EMAIL.get("smtp_port", 587)
-        if smtp_port == 465:
-            smtp_cls = smtplib.SMTP_SSL
-        else:
-            smtp_cls = smtplib.SMTP
-        with smtp_cls(EMAIL["smtp_host"], smtp_port) as server:
-            server.ehlo()
-            if smtp_port != 465:
-                server.starttls()
-                server.ehlo()
-            server.login(EMAIL["address"], EMAIL["password"])
-            recipients = [params.to]
-            if params.cc:
-                recipients.extend([a.strip() for a in params.cc.split(",")])
-            server.sendmail(EMAIL["address"], recipients, msg.as_string())
+        recipients = [params.to]
+        if params.cc:
+            recipients.extend([a.strip() for a in params.cc.split(",")])
 
-        # 存到已发送（best-effort）
-        try:
-            imap = imaplib.IMAP4_SSL(EMAIL["imap_host"], EMAIL.get("imap_port", 993))
-            imap.login(EMAIL["address"], EMAIL["password"])
-            for folder in ['"Sent Messages"', '"Sent"', '"已发送"', '"[Gmail]/Sent Mail"']:
-                try:
-                    imap.select(folder)
-                    imap.append(folder, "\\Seen",
-                        imaplib.Time2Internaldate(datetime.now(timezone.utc)),
-                        msg.as_bytes())
-                    break
-                except Exception:
-                    continue
-            imap.logout()
-        except Exception:
-            pass
+        _smtp_send(msg, recipients)
+
+        # 存到已发送（best-effort，跳过以减少超时风险）
+        # 163的已发送文件夹编码名不好猜，先不存了
 
         return json.dumps({"status": "sent", "to": params.to, "subject": params.subject}, ensure_ascii=False)
     except Exception as e:
@@ -296,6 +319,8 @@ async def mail_folders() -> str:
 
 if __name__ == "__main__":
     import sys
+
+    log.info(f"Mail bridge starting: {EMAIL['address']} | SMTP {EMAIL['smtp_host']}:{EMAIL.get('smtp_port',465)} | timeout={SMTP_TIMEOUT}s")
 
     # 默认 SSE 模式（云平台兼容性最好，端点在 /sse）
     # 可选 streamable-http 模式（端点在 /mcp）
