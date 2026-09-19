@@ -1,7 +1,3 @@
-# bridge.py (轻量版)
-requests
-
-# mcp_server.py (MCP 版，按需安装)
-# mcp[cli]
-# uvicorn
-# pydantic
+mcp[cli]
+uvicorn
+pydantic
